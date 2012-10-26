@@ -1,0 +1,4 @@
+name = "Vietcoop Module Auto Install"
+description = "Function auto download and install dependence module"
+core = 7.x
+package = "Vietcoop"

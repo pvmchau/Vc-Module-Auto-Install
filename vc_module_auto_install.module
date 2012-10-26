@@ -1,0 +1,468 @@
+<?php
+/**
+ * Implementation of hook_menu()
+ */
+function vc_module_auto_install_menu() {
+  $items = array();
+  $items['admin/vc/modules'] = array(
+    'title' => 'Modules',
+    'description' => 'Extend site functionality.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('vc_module_form'),
+    'access arguments' => array('administer modules'),
+  );
+  
+  $items['admin/vc/modules/list'] = array(
+    'title' => 'List',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+  $items['admin/vc/modules/list/confirm'] = array(
+    'title' => 'List',
+    'access arguments' => array('administer modules'),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  
+  return $items;
+}
+
+/**
+ * Menu callback; provides module enable/disable interface.
+ *
+ * The list of modules gets populated by module.info files, which contain each
+ * module's name, description, and information about which modules it requires.
+ * See drupal_parse_info_file() for information on module.info descriptors.
+ *
+ * Dependency checking is performed to ensure that a module:
+ * - can not be enabled if there are disabled modules it requires.
+ * - can not be disabled if there are enabled modules which depend on it.
+ *
+ * @param $form_state
+ *   An associative array containing the current state of the form.
+ *
+ * @return
+ *   The form array.
+ *
+ * @ingroup forms
+ * @see theme_system_modules()
+ * @see system_modules_submit()
+ */
+ 
+function vc_module_form ($form, $form_state) {
+  include_once DRUPAL_ROOT . '/modules/system/system.admin.inc';
+  
+  // Get current list of modules.
+  $files = system_rebuild_module_data();
+  
+  // Remove hidden modules from display list.
+  $visible_files = $files;
+  foreach ($visible_files as $filename => $file) {
+    if (!empty($file->info['hidden'])) {
+      unset($visible_files[$filename]);
+    }
+  }
+  
+  uasort($visible_files, 'system_sort_modules_by_info_name');
+  
+  // If the modules form was submitted, then system_modules_submit() runs first
+  // and if there are unfilled required modules, then $form_state['storage'] is
+  // filled, triggering a rebuild. In this case we need to display a
+  // confirmation form.
+  if (!empty($form_state['storage'])) {
+    return vc_module_confirm_form($visible_files, $form_state['storage']);
+  }
+
+  $modules = array();
+  $form['modules'] = array('#tree' => TRUE);
+
+  // Used when displaying modules that are required by the install profile.
+  require_once DRUPAL_ROOT . '/includes/install.inc';
+  $distribution_name = check_plain(drupal_install_profile_distribution_name());
+
+  // Iterate through each of the modules.
+  foreach ($visible_files as $filename => $module) {
+    $extra = array();
+    $extra['enabled'] = (bool) $module->status;
+    if (!empty($module->info['required'] )) {
+      $extra['disabled'] = TRUE;
+      $extra['required_by'][] = $distribution_name . (!empty($module->info['explanation']) ? ' ('. $module->info['explanation'] .')' : '');
+    }
+
+    // If this module requires other modules, add them to the array.
+    foreach ($module->requires as $requires => $v) {
+      if (!isset($files[$requires])) {
+        $extra['requires'][$requires] = t('@module (<span class="admin-missing">missing</span>)', array('@module' => drupal_ucfirst($requires)));
+        $extra['disabled'] = FALSE;
+      }
+      // Only display visible modules.
+      elseif (isset($visible_files[$requires])) {
+        $requires_name = $files[$requires]->info['name'];
+        // Disable this module if it is incompatible with the dependency's version.
+        if ($incompatible_version = drupal_check_incompatibility($v, str_replace(DRUPAL_CORE_COMPATIBILITY . '-', '', $files[$requires]->info['version']))) {
+          $extra['requires'][$requires] = t('@module (<span class="admin-missing">incompatible with</span> version @version)', array(
+            '@module' => $requires_name . $incompatible_version,
+            '@version' => $files[$requires]->info['version'],
+          ));
+          $extra['disabled'] = TRUE;
+        }
+        // Disable this module if the dependency is incompatible with this
+        // version of Drupal core.
+        elseif ($files[$requires]->info['core'] != DRUPAL_CORE_COMPATIBILITY) {
+          $extra['requires'][$requires] = t('@module (<span class="admin-missing">incompatible with</span> this version of Drupal core)', array(
+            '@module' => $requires_name,
+          ));
+          $extra['disabled'] = TRUE;
+        }
+        elseif ($files[$requires]->status) {
+          $extra['requires'][$requires] = t('@module (<span class="admin-enabled">enabled</span>)', array('@module' => $requires_name));
+        }
+        else {
+          $extra['requires'][$requires] = t('@module (<span class="admin-disabled">disabled</span>)', array('@module' => $requires_name));
+        }
+      }
+    }
+
+    // If this module is required by other modules, list those, and then make it
+    // impossible to disable this one.
+    foreach ($module->required_by as $required_by => $v) {
+      // Hidden modules are unset already.
+      if (isset($visible_files[$required_by])) {
+        if ($files[$required_by]->status == 1 && $module->status == 1) {
+          $extra['required_by'][] = t('@module (<span class="admin-enabled">enabled</span>)', array('@module' => $files[$required_by]->info['name']));
+          $extra['disabled'] = TRUE;
+        }
+        else {
+          $extra['required_by'][] = t('@module (<span class="admin-disabled">disabled</span>)', array('@module' => $files[$required_by]->info['name']));
+        }
+      }
+    }
+    if ($module->status == '1') {
+      $extra['disabled'] = TRUE;
+    }  
+    $form['modules'][$module->info['package']][$filename] = _system_modules_build_row($module->info, $extra);
+  }
+
+  // Add basic information to the fieldsets.
+  foreach (element_children($form['modules']) as $package) {
+    $form['modules'][$package] += array(
+      '#type' => 'fieldset',
+      '#title' => t($package),
+      '#collapsible' => TRUE,
+      '#theme' => 'system_modules_fieldset',
+      '#header' => array(
+        array('data' => t('Enabled'), 'class' => array('checkbox')),
+        t('Name'),
+        t('Version'),
+        t('Description'),        
+      ),
+      // Ensure that the "Core" package fieldset comes first.
+      '#weight' => $package == 'Core' ? -10 : NULL,
+    );
+  }
+
+  // Lastly, sort all fieldsets by title.
+  uasort($form['modules'], 'element_sort_by_title');
+
+  $form['actions'] = array('#type' => 'actions');
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save configuration'),
+  );
+  $form['#action'] = url('admin/vc/modules/list/confirm');
+
+  return $form;
+}
+
+/**
+ * Array sorting callback; sorts modules or themes by their name.
+ */
+function XXX_system_sort_modules_by_info_name($a, $b) {
+  return strcasecmp($a->info['name'], $b->info['name']);
+}
+
+/**
+ * Build a table row for the system modules page.
+ */
+function XXX_system_modules_build_row($info, $extra) {
+  // Add in the defaults.
+  $extra += array(
+    'requires' => array(),
+    'required_by' => array(),
+    'disabled' => FALSE,
+    'enabled' => FALSE,
+    'links' => array(),
+  );
+  $form = array(
+    '#tree' => TRUE,
+  );
+  // Set the basic properties.
+  $form['name'] = array(
+    '#markup' => $info['name'],
+  );
+  $form['description'] = array(
+    '#markup' => t($info['description']),
+  );
+  $form['version'] = array(
+    '#markup' => $info['version'],
+  );
+  $form['#requires'] = $extra['requires'];
+  $form['#required_by'] = $extra['required_by'];
+
+  // Check the compatibilities.
+  $compatible = TRUE;
+  $status_short = '';
+  $status_long = '';
+
+  // Check the core compatibility.
+  if (!isset($info['core']) || $info['core'] != DRUPAL_CORE_COMPATIBILITY) {
+    $compatible = FALSE;
+    $status_short .= t('Incompatible with this version of Drupal core.');
+    $status_long .= t('This version is not compatible with Drupal !core_version and should be replaced.', array('!core_version' => DRUPAL_CORE_COMPATIBILITY));
+  }
+
+  // Ensure this module is compatible with the currently installed version of PHP.
+  if (version_compare(phpversion(), $info['php']) < 0) {
+    $compatible = FALSE;
+    $status_short .= t('Incompatible with this version of PHP');
+    $php_required = $info['php'];
+    if (substr_count($info['php'], '.') < 2) {
+      $php_required .= '.*';
+    }
+    $status_long .= t('This module requires PHP version @php_required and is incompatible with PHP version !php_version.', array('@php_required' => $php_required, '!php_version' => phpversion()));
+  }
+
+  // If this module is compatible, present a checkbox indicating
+  // this module may be installed. Otherwise, show a big red X.
+  if ($compatible) {
+    $form['enable'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable'),
+      '#default_value' => $extra['enabled'],
+    );
+    if ($extra['disabled']) {
+      $form['enable']['#disabled'] = TRUE;
+    }
+  }
+  else {
+    $form['enable'] = array(
+      '#markup' =>  theme('image', array('path' => 'misc/watchdog-error.png', 'alt' => $status_short, 'title' => $status_short)),
+    );
+    $form['description']['#markup'] .= theme('system_modules_incompatible', array('message' => $status_long));
+  }
+
+  // Build operation links.
+  foreach (array('help', 'permissions', 'configure') as $key) {
+    $form['links'][$key] = (isset($extra['links'][$key]) ? $extra['links'][$key] : array());
+  }
+
+  return $form;
+}
+
+/**
+ * Display confirmation form for required modules.
+ *
+ * @param $modules
+ *   Array of module file objects as returned from system_rebuild_module_data().
+ * @param $storage
+ *   The contents of $form_state['storage']; an array with two
+ *   elements: the list of required modules and the list of status
+ *   form field values from the previous screen.
+ * @ingroup forms
+ */
+function vc_module_confirm_form($modules, $storage) {
+  $items = array();
+
+  $form['validation_modules'] = array('#type' => 'value', '#value' => $modules);
+  $form['status']['#tree'] = TRUE;
+
+  foreach ($storage['more_required'] as $info) {
+    $t_argument = array(
+      '@module' => $info['name'],
+      '@required' => implode(', ', $info['requires']),
+    );
+    $items[] = format_plural(count($info['requires']), 'You must enable the @required module to install @module.', 'You must enable the @required modules to install @module.', $t_argument);
+  }
+dsm($storage);
+  foreach ($storage['missing_modules'] as $name => $info) {
+    $t_argument = array(
+      '@module' => $name,
+      '@depends' => implode(', ', $info['depends']),
+    );
+    $items[] = format_plural(count($info['depends']), 'The @module module is missing, so the following module will be disabled: @depends.', 'The @module module is missing, so the following modules will be disabled: @depends.', $t_argument);
+  }
+
+  $form['text'] = array('#markup' => theme('item_list', array('items' => $items)));
+
+  if ($form) {
+    // Set some default form values
+    $form = confirm_form(
+      $form,
+      t('Some required modules must be enabled'),
+      'admin/modules',
+      t('Would you like to continue with the above?'),
+      t('Continue'),
+      t('Cancel'));
+    return $form;
+  }
+}
+
+/**
+ * Submit callback; handles modules form submission.
+ */
+function vc_module_form_submit($form, &$form_state) {
+  include_once DRUPAL_ROOT . '/includes/install.inc';
+
+  // Builds list of modules.
+  $modules = array();
+  // If we're not coming from the confirmation form, build the list of modules.
+  if (empty($form_state['storage'])) {
+    // If we're not coming from the confirmation form, build the module list.
+    foreach ($form_state['values']['modules'] as $group_name => $group) {
+      foreach ($group as $module => $enabled) {
+        $modules[$module] = array('group' => $group_name, 'enabled' => $enabled['enable']);
+      }
+    }
+  }
+  else {
+    // If we are coming from the confirmation form, fetch
+    // the modules out of $form_state.
+    $modules = $form_state['storage']['modules'];
+  }
+
+  // Collect data for all modules to be able to determine dependencies.
+  $files = system_rebuild_module_data();
+
+  // Sorts modules by weight.
+  $sort = array();
+  foreach (array_keys($modules) as $module) {
+    $sort[$module] = $files[$module]->sort;
+  }
+  array_multisort($sort, $modules);
+
+  // Makes sure all required modules are set to be enabled.
+  $more_required = array();
+  $missing_modules = array();
+  foreach ($modules as $name => $module) {
+    if ($module['enabled']) {
+      // Checks that all dependencies are set to be enabled.  Stores the ones
+      // that are not in $dependencies variable so that the user can be alerted
+      // in the confirmation form that more modules need to be enabled.
+      $dependencies = array();
+      foreach (array_keys($files[$name]->requires) as $required) {
+        if (empty($modules[$required]['enabled'])) {
+          if (isset($files[$required])) {
+            $dependencies[] = $files[$required]->info['name'];
+            $modules[$required]['enabled'] = TRUE;
+          }
+          else {
+            $missing_modules[$required]['depends'][] = $name;
+            $modules[$name]['enabled'] = FALSE;
+          }
+        }
+      }
+
+      // Stores additional modules that need to be enabled in $more_required.
+      if (!empty($dependencies)) {
+        $more_required[$name] = array(
+          'name' => $files[$name]->info['name'],
+          'requires' => $dependencies,
+        );
+      }
+    }
+  }
+
+  if (!isset($form_state['values']['confirm']) ) {
+    if (!empty($form_state['storage']['missing_modules'])) {
+      $missing = $form_state['storage']['missing_modules'];
+    }
+  }
+  
+  // Redirects to confirmation form if more modules need to be enabled.
+  if ((!empty($more_required) || !empty($missing_modules)) && !isset($form_state['values']['confirm'])) {
+    $form_state['storage'] = array(
+      'more_required' => $more_required,
+      'modules' => $modules,
+      'missing_modules' => $missing_modules,
+    );
+    $form_state['rebuild'] = TRUE;
+    return;
+  }
+  
+  if (isset($missing)) {
+    foreach ($missing as $name => $module) {
+      $module_to_download[] = $name;
+      foreach ($module['depends'][0] as $depends_name) {
+        $depends_missing_module[] = $depends_name;
+      }      
+    }
+  
+    $download_string = implode(" ", $module_to_download);
+    //exec('drush dl '.$download_string, $result);
+    exec('drush dl oauth_common --yes', $result);    
+    dsm($result);
+    foreach ($missing as $name => $value) {
+      $module[$name]['enabled'] = TRUE;
+    }      
+    foreach ($depends_missing_module as $name => $value) {
+      $module[$name]['enabled'] = TRUE;
+    }
+  }
+
+  // Invokes hook_requirements('install').  If failures are detected, makes sure
+  // the dependent modules aren't installed either.
+  foreach ($modules as $name => $module) {
+    // Only invoke hook_requirements() on modules that are going to be installed.
+    if ($module['enabled'] && drupal_get_installed_schema_version($name) == SCHEMA_UNINSTALLED) {
+      if (!drupal_check_module($name)) {
+        $modules[$name]['enabled'] = FALSE;
+        foreach (array_keys($files[$name]->required_by) as $required_by) {
+          $modules[$required_by]['enabled'] = FALSE;
+        }
+      }
+    }
+  }
+
+  // Initializes array of actions.
+  $actions = array(
+    'enable' => array(),
+    'disable' => array(),
+    'install' => array(),
+  );
+
+  // Builds arrays of modules that need to be enabled, disabled, and installed.
+  foreach ($modules as $name => $module) {
+    if ($module['enabled']) {
+      if (drupal_get_installed_schema_version($name) == SCHEMA_UNINSTALLED) {
+        $actions['install'][] = $name;
+        $actions['enable'][] = $name;
+      }
+      elseif (!module_exists($name)) {
+        $actions['enable'][] = $name;
+      }
+    }
+    elseif (module_exists($name)) {
+      $actions['disable'][] = $name;
+    }
+  }
+
+  // Gets list of modules prior to install process, unsets $form_state['storage']
+  // so we don't get redirected back to the confirmation form.
+  $pre_install_list = module_list();
+  unset($form_state['storage']);
+
+  // Reverse the 'enable' list, to order dependencies before dependents.
+  krsort($actions['enable']);
+
+  // Installs, enables, and disables modules.
+  module_enable($actions['enable'], FALSE);
+  module_disable($actions['disable'], FALSE);
+
+  // Gets module list after install process, flushes caches and displays a
+  // message if there are changes.
+  $post_install_list = module_list(TRUE);
+  if ($pre_install_list != $post_install_list) {
+    drupal_flush_all_caches();
+    drupal_set_message(t('The configuration options have been saved.'));
+  }
+
+  $form_state['redirect'] = 'admin/vc/modules';
+}
